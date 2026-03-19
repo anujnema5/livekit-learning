@@ -22,8 +22,8 @@ from livekit.agents import (
     inference,
 )  # Inference creates model instances from model strings
 from livekit.agents import AgentStateChangedEvent, MetricsCollectedEvent, metrics
-from livekit.agents import function_tool, AgentTask, RunContext, TaskGroup
-from dataclasses import dataclass
+from livekit.agents import function_tool, RunContext
+from livekit.agents import mcp
 import httpx
 
 
@@ -34,130 +34,96 @@ logger = logging.getLogger(__name__)
 # Make sure you have a .env file with your keys
 load_dotenv()
 
-@dataclass
-class EmailResult:
-    email_address: str
-    
-@dataclass
-class AddressResult:
-    address: str
-    
-class GetEmailTask(AgentTask[EmailResult]):
-    def __init__(self, chat_ctx=None):
-        super().__init__(
-            instructions="Ask the user for their email address and return it.",
-        )
-    
-    @function_tool
-    async def record_email(self, email: str) -> EmailResult:
-        """Use this function to return the user's email address."""
-        return EmailResult(email_address=email)
-    
-class GetAddressTask(AgentTask[AddressResult]):
-    def __init__(self, chat_ctx=None):
-        super().__init__(
-            instructions="Ask the user for their shipping address and return it.",
-        )
-    
-    @function_tool
-    async def record_address(self, address: str) -> AddressResult:
-        """Use this function to return the user's shipping address."""
-        return AddressResult(address=address)
-    
-class CheckoutAgent(Agent):
-    async def on_enter(self) -> None:
-        task_group = TaskGroup()
-        
-        # Each task is wrapped in a lambda if the user needs to go back and make a correction
-        task_group.add(
-            lambda: GetEmailTask(),
-            id="email",
-            description="Collect user's email address"
-        )
-        task_group.add(
-            lambda: GetAddressTask(),
-            id="address",
-            description="Collect user's shipping address"
-        )
-        
-        results = await task_group
-        
-        email = results["email"].email_address
-        address = results["address"].address
-        
-        # Best thing about this task group that we can go back to the previous task that makes our user data collection more natural.
-        await self.session.generate_reply(
-            instructions=f"Confirm the order details with the user. Email: {email}, Address: {address}. If details are correct, proceed to checkout. If not, ask which one is incorrect and loop back to the relevant task."
-        )
-
-class Manager(Agent):
-    def __init__(self, chat_ctx=None) -> None:
-        super().__init__(
-            instructions=(
-                "You are a manager for a team of helpful voice AI assistants. "
-                "Handle escalations professionally."
-            ),
-            tts="cartesia/sonic-3:0c9c3b1e-5c8d-4a7c-9a1b-8fbb3fbbacfa",  # A more authoritative voice for the manager
-            chat_ctx=chat_ctx,
-        )
-
-
-class CollectConsent(AgentTask[bool]):
-    def __init__(self, chat_ctx=None):
-        super().__init__(
-            instructions="""
-            Ask for recording consent and get a clear yes or no answer.
-            Be polite and professional.
-            """,
-            chat_ctx=chat_ctx,
-        )
-
-    async def on_enter(self) -> None:
-        await self.session.generate_reply(
-            instructions="""
-            Briefly introduce yourself, then ask for permission to record the call for quality assurance and training purposes.
-            Make it clear that they can decline.
-            """
-        )
-
-    @function_tool
-    async def consent_given(self) -> None:
-        """Use this when the user gives consent to record."""
-        self.complete(True)
-
-    @function_tool
-    async def consent_denied(self) -> None:
-        """Use this when the user denies consent to record."""
-        self.complete(False)
-
 
 # This class defines how your AI behaves
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             # This is like the "personality" or instructions for your AI
-            instructions=("You are a friendly customer service representative."),
+            instructions=(
+                "You are an upbeat, slightly sarcastic voice AI for tech support."
+                "Help the caller fix issues without rambling, and keep replies under 3 sentences."
+                "You can also look up the weather if asked."
+                "You can also answer question about LiveKit's features and pricing, using the MCP tool to fetch real-time info from https://api.livekit.cloud/mcp When user asks about LiveKit's features or pricing, use the MCP tool to provide accurate and up-to-date information. Always check the latest data from the MCP API before responding to ensure your answers reflect any recent changes or updates in LiveKit's offerings."
+            ),
         )
 
-    async def on_enter(self) -> None:
-        consent = await CollectConsent(
-            chat_ctx=self.chat_ctx
-        )  # self.chat_ctx is the chat conversation context that contains the history of messages between the user and the agent. By passing it to the CollectConsent task, we ensure that the consent question and answer are part of the same conversation flow.
-        if consent:
-            await self.session.say(
-                "Thank you for consenting to the recording. How can I assist you today?"
-            )
-        else:
-            await self.session.say(
-                "No problem, I won't record our conversation. How can I assist you today?"
-            )
+    @function_tool  # Callable tool for the LLM to use. The LLM can call this function when it thinks it's appropriate based on the conversation.
+    async def lookup_weather(self, context: RunContext, location: str) -> str:
+        """Look up current weather for a city or location. Use this when the user asks about weather, temperature, or conditions in a specific place.
 
-    @function_tool
-    async def escalate_to_manager(self, context: RunContext):
-        """Escalate the call to a manager on user request."""
-        # It's gonna call Manager Agent and pass the chat context so the manager can see the conversation history
-        # So when a tool return a new Agent as a first value in the tuple, The session will automatically hands off control to that agent, and the second value in the tuple is the message that will be said by the agent before off the handoff to the agent.
-        return Manager(chat_ctx=self.chat_ctx), "Escalating you to my manager now."
+        Args:
+            location: The city name or location to look up (e.g. "London", "New York", "Tokyo").
+        """
+        logger.info("Looking up weather for %s", location)
+
+        try:
+            # Optional: have the agent say something while fetching data
+            await context.session.say("Let me check the weather for you...")  
+            context.disallow_interruptions()
+            # So if we are using any task that should not be undone in between, like payment or booking, we can use context.session.run_critical_section to make sure it runs without interruption.
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # 1. Geocoding: Convert city name to lat/lon
+                geo_response = await client.get(
+                    "https://geocoding-api.open-meteo.com/v1/search",
+                    params={"name": location, "count": 1},
+                )
+                geo_data = geo_response.json()
+
+                if not geo_data.get("results"):
+                    return f"Could not find location: {location}"
+
+                lat = geo_data["results"][0]["latitude"]
+                lon = geo_data["results"][0]["longitude"]
+                place_name = geo_data["results"][0]["name"]
+
+                # 2. Fetch weather (current_weather=true enables the current_weather object in response)
+                weather_response = await client.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": lat,
+                        "longitude": lon,
+                        "current_weather": True,
+                        "temperature_unit": "fahrenheit",
+                    },
+                )
+
+                if weather_response.status_code != 200:
+                    return f"Weather data for {place_name} is currently unavailable."
+
+                w_data = weather_response.json().get("current_weather", {})
+                if not w_data:
+                    return f"Weather data for {place_name} is currently unavailable."
+
+                temp = w_data.get("temperature", "N/A")
+                code = w_data.get("weathercode", 0)
+                # WMO weather codes: 0=clear, 1-3=cloudy, 45-48=fog, 51-67=rain/drizzle, 71-77=snow, 80-99=showers/thunderstorm
+                conditions = _weather_code_to_text(code)
+
+                return f"In {place_name}, it's {temp} degrees Fahrenheit with {conditions}."
+
+        except httpx.TimeoutException:
+            return "The request timed out. Please try again."
+        except Exception as exc:
+            logger.error("Weather tool error: %s", exc)
+            return "An unexpected error occurred while fetching the weather."
+
+
+def _weather_code_to_text(code: int) -> str:
+    """Convert WMO weather code to human-readable description."""
+    if code == 0:
+        return "clear skies"
+    if code in (1, 2, 3):
+        return "partly cloudy" if code == 1 else "cloudy"
+    if 45 <= code <= 48:
+        return "foggy"
+    if 51 <= code <= 67:
+        return "rain"
+    if 71 <= code <= 77:
+        return "snow"
+    if 80 <= code <= 99:
+        return "showers or storms" if code >= 95 else "rain showers"
+    return "variable conditions"
 
 
 # This server handles incoming users and assigns them to the agent
@@ -202,6 +168,9 @@ async def entrypoint(ctx: JobContext):
         # - Preemtive generation helps the agent start forming a response before the user finishes speaking.
         # The agents wait for a clear end of turn before actually speaking, but the thinking has already begun
         preemptive_generation=True,
+        
+        # When the session starts, it connects to the MCP server to enable real-time access to LiveKit's features and pricing information. This allows the agent to provide accurate and up-to-date responses when users ask about LiveKit's offerings.
+        mcp_servers=[mcp.MCPServerConfig("https://api.livekit.cloud/mcp")],
     )
 
     # Aggregate metrics across all conversation turns. It tracks token count for the LLM, audio duration for STT and TTS. and cost estimation based on usage.
