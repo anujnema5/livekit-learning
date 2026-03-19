@@ -23,6 +23,7 @@ from livekit.agents import (
 )  # Inference creates model instances from model strings
 from livekit.agents import AgentStateChangedEvent, MetricsCollectedEvent, metrics
 from livekit.agents import function_tool, RunContext
+from livekit.agents import mcp
 import httpx
 
 
@@ -43,6 +44,7 @@ class Assistant(Agent):
                 "You are an upbeat, slightly sarcastic voice AI for tech support."
                 "Help the caller fix issues without rambling, and keep replies under 3 sentences."
                 "You can also look up the weather if asked."
+                "You can also answer question about LiveKit's features and pricing, using the MCP tool to fetch real-time info from https://api.livekit.cloud/mcp When user asks about LiveKit's features or pricing, use the MCP tool to provide accurate and up-to-date information. Always check the latest data from the MCP API before responding to ensure your answers reflect any recent changes or updates in LiveKit's offerings."
             ),
         )
 
@@ -56,6 +58,10 @@ class Assistant(Agent):
         logger.info("Looking up weather for %s", location)
 
         try:
+            # Optional: have the agent say something while fetching data
+            await context.session.say("Let me check the weather for you...")  
+            context.disallow_interruptions()
+            # So if we are using any task that should not be undone in between, like payment or booking, we can use context.session.run_critical_section to make sure it runs without interruption.
             async with httpx.AsyncClient(timeout=10.0) as client:
                 # 1. Geocoding: Convert city name to lat/lon
                 geo_response = await client.get(
@@ -119,6 +125,7 @@ def _weather_code_to_text(code: int) -> str:
         return "showers or storms" if code >= 95 else "rain showers"
     return "variable conditions"
 
+
 # This server handles incoming users and assigns them to the agent
 server = AgentServer()
 
@@ -161,6 +168,9 @@ async def entrypoint(ctx: JobContext):
         # - Preemtive generation helps the agent start forming a response before the user finishes speaking.
         # The agents wait for a clear end of turn before actually speaking, but the thinking has already begun
         preemptive_generation=True,
+        
+        # When the session starts, it connects to the MCP server to enable real-time access to LiveKit's features and pricing information. This allows the agent to provide accurate and up-to-date responses when users ask about LiveKit's offerings.
+        mcp_servers=[mcp.MCPServerConfig("https://api.livekit.cloud/mcp")],
     )
 
     # Aggregate metrics across all conversation turns. It tracks token count for the LLM, audio duration for STT and TTS. and cost estimation based on usage.
